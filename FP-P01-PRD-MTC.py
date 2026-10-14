@@ -2,7 +2,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import io
-import os
 import re
 import unicodedata
 
@@ -30,8 +29,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_FILE = "1a54dac1-ec50-4498-ad65-871e80328f60 (1).xlsx"
-
 COLORS = {
     "primary":  "#1b60a7",
     "success":  "#2ca02c",
@@ -40,27 +37,39 @@ COLORS = {
     "info":     "#17becf",
     "bg":       "#F0F4F8",
     "pred":     "#7a3db8",
-    "Q1": "brown",
-    "Q2": "orange",
-    "Q3": "green",
-    "Q4": "dodgerblue",
 }
 
 MONTH_MAP = {
     "ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6,
-    "jul": 7, "ago": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dic": 12,
+    "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12,
 }
 
-NUM_COLS = [
-    "ano_siembra", "ano", "ton_ppto", "ppr", "racimos", "ton_real",
-    "dias_ciclo_cos", "dias_ciclo_enf", "dias_ciclo_poli", "area_neta",
-]
+# Ciclo agronómico: 12 meses, del 1 de abril al 31 de marzo del año siguiente
+MES_INICIO_CAMPAÑA = 4
 
-TEXT_COLS = ["gran_zona", "finca", "bloque", "lote", "material", "estado", "mes"]
+# ── Esquema del dataset: columna interna → tipo y alias aceptados ──
+SCHEMA = {
+    "gran_zona":      {"tipo": "texto",  "alias": ["gran zona", "zona", "region"]},
+    "finca":          {"tipo": "texto",  "alias": ["finca", "farm", "hacienda"]},
+    "bloque":         {"tipo": "texto",  "alias": ["bloque", "block"]},
+    "lote":           {"tipo": "texto",  "alias": ["lote", "lot", "parcela"]},
+    "material":       {"tipo": "texto",  "alias": ["material", "genotipo", "variedad"]},
+    "estado":         {"tipo": "texto",  "alias": ["estado", "status", "etapa"]},
+    "ano_siembra":    {"tipo": "numero", "alias": ["ano siembra", "ano de siembra", "siembra", "planting year"]},
+    "ano":            {"tipo": "numero", "alias": ["ano", "year", "anio"]},
+    "mes":            {"tipo": "texto",  "alias": ["mes", "month"]},
+    "ton_ppto":       {"tipo": "numero", "alias": ["ton ppto", "ton presupuesto", "presupuesto"]},
+    "ppr":            {"tipo": "numero", "alias": ["ppr", "peso racimo", "peso por racimo"]},
+    "racimos":        {"tipo": "numero", "alias": ["racimos", "bunches"]},
+    "ton_real":       {"tipo": "numero", "alias": ["ton real", "produccion real", "produccion", "toneladas"]},
+    "dias_ciclo_cos": {"tipo": "numero", "alias": ["dias ciclo cos", "dias de ciclo cos", "dias cos"]},
+    "dias_ciclo_enf": {"tipo": "numero", "alias": ["dias ciclo enf", "dias de ciclo enf", "dias enf"]},
+    "dias_ciclo_poli": {"tipo": "numero", "alias": ["dias ciclo poli", "dias de ciclo poli", "dias poli"]},
+    "area_neta":      {"tipo": "numero", "alias": ["area neta", "hectareas", "area ha", "superficie neta"]},
+}
 
-# Features estructurales del modelo (sin racimos/ppr/ton_ppto: fuga de información)
 FEATURES_BASE = [
-    "edad", "area_neta", "dias_ciclo_cos", "dias_ciclo_enf",
+    "edad", "dias_ciclo_cos", "dias_ciclo_enf",
     "dias_ciclo_poli", "mes_sin", "mes_cos",
 ]
 
@@ -112,7 +121,7 @@ st.markdown("""
 
 
 # ──────────────────────────────────────────────────────────────
-# 1. CARGA Y NORMALIZACIÓN DE DATOS
+# 1. CARGA Y NORMALIZACIÓN DE DATOS (GUIADA POR ESQUEMA)
 # ──────────────────────────────────────────────────────────────
 
 def normalize_colname(col: str) -> str:
@@ -122,7 +131,7 @@ def normalize_colname(col: str) -> str:
     col = col.replace("%", "pct")
     col = col.replace("/", "_").replace("-", "_").replace("+", "_").replace(".", "_")
     col = re.sub(r"[()\[\]{}]", "", col)
-    col = re.sub(r"[^a-z0a-z0-9_]+", "_", col)
+    col = re.sub(r"[^a-z0-9_]+", "_", col)
     col = re.sub(r"_+", "_", col).strip("_")
     return col
 
@@ -130,6 +139,33 @@ def normalize_colname(col: str) -> str:
 def sanitize_key(s):
     return (str(s).replace(" ", "_").replace("/", "_").replace("-", "_")
                   .replace(".", "_").replace("(", "").replace(")", ""))
+
+
+def campaña_de_fecha(f):
+    f = pd.Timestamp(f)
+    y = int(f.year)
+    return f"{y}-{y + 1}" if f.month >= MES_INICIO_CAMPAÑA else f"{y - 1}-{y}"
+
+
+def resolver_columnas(df: pd.DataFrame) -> tuple:
+    normalizadas = {normalize_colname(c): c for c in df.columns}
+    renombres, faltantes = {}, []
+
+    for interno, spec in SCHEMA.items():
+        if interno in df.columns:
+            continue
+        hallado = None
+        for alias in spec["alias"]:
+            na = normalize_colname(alias)
+            if na in normalizadas:
+                hallado = normalizadas[na]
+                break
+        if hallado:
+            renombres[hallado] = interno
+        else:
+            faltantes.append(f"**{interno}** (acepta: {', '.join(spec['alias'])})")
+
+    return renombres, faltantes
 
 
 def cargar_dataset_produccion(file_bytes: bytes, file_name: str = "") -> pd.DataFrame:
@@ -143,27 +179,48 @@ def cargar_dataset_produccion(file_bytes: bytes, file_name: str = "") -> pd.Data
 
     df = df_raw.copy()
     df.columns = [normalize_colname(c) for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    requeridas = set(TEXT_COLS) | set(NUM_COLS)
-    faltantes = [c for c in requeridas if c not in df.columns]
+    renombres, faltantes = resolver_columnas(df)
     if faltantes:
-        raise ValueError(f"Faltan columnas en el dataset: {faltantes}")
+        raise ValueError(
+            "El archivo no cumple el esquema del dashboard. Faltan columnas:\n\n"
+            + "\n".join(f"- {f}" for f in faltantes)
+            + "\n\nEl sistema normaliza acentos, mayúsculas y espacios; revisa "
+            "los alias aceptados en el panel lateral."
+        )
+    df = df.rename(columns=renombres)
 
-    for c in TEXT_COLS:
-        df[c] = df[c].astype(str).str.strip().str.upper()
+    texto_cols = [c for c, s in SCHEMA.items() if s["tipo"] == "texto"]
+    numero_cols = [c for c, s in SCHEMA.items() if s["tipo"] == "numero"]
 
-    for c in NUM_COLS:
+    for c in texto_cols:
+        df[c] = (df[c].astype(str).str.strip().str.upper()
+                 .replace({"NAN": np.nan, "NONE": np.nan, "NULL": np.nan, "": np.nan}))
+
+    for c in numero_cols:
         df[c] = pd.to_numeric(
             df[c].astype(str).str.replace(",", ".", regex=False),
             errors="coerce",
         )
 
-    df["mes_num"] = df["mes"].str.lower().map(MONTH_MAP)
-    df = df.dropna(subset=["mes_num", "ano"]).copy()
+    # Mes: acepta texto ('ene', 'sept', 'Enero') o numérico (1–12)
+    mes_pref = df["mes"].astype(str).str.strip().str.lower().str[:3]
+    df["mes_num"] = mes_pref.map(MONTH_MAP)
+    sin_mes = df["mes_num"].isna()
+    if sin_mes.any():
+        df.loc[sin_mes, "mes_num"] = pd.to_numeric(df.loc[sin_mes, "mes"], errors="coerce")
+    df["mes_num"] = pd.to_numeric(df["mes_num"], errors="coerce")
 
+    df = df.dropna(subset=["mes_num", "ano"]).copy()
+    if df.empty:
+        raise ValueError("No hay filas con año y mes válidos tras la carga.")
+
+    df["ano"] = df["ano"].astype(int)
     df["fecha"] = pd.to_datetime(
-        dict(year=df["ano"].astype(int), month=df["mes_num"].astype(int), day=1)
+        dict(year=df["ano"], month=df["mes_num"].astype(int), day=1)
     )
+    df["campaña"] = df["fecha"].apply(campaña_de_fecha)
 
     df["edad"] = df["ano"] - df["ano_siembra"]
     df["ton_ha"] = np.where(df["area_neta"] > 0, df["ton_real"] / df["area_neta"], np.nan)
@@ -174,15 +231,11 @@ def cargar_dataset_produccion(file_bytes: bytes, file_name: str = "") -> pd.Data
     df["mes_sin"] = np.sin(2 * np.pi * df["mes_num"] / 12)
     df["mes_cos"] = np.cos(2 * np.pi * df["mes_num"] / 12)
 
-    # Corte histórico: los meses futuros traen Ton Real = 0 (solo presupuesto)
     ultimo_con_cosecha = df.loc[df["ton_real"] > 0, "fecha"].max()
     if pd.isna(ultimo_con_cosecha):
         raise ValueError("El dataset no contiene producción real (Ton Real > 0).")
 
     df["es_historico"] = df["fecha"] <= ultimo_con_cosecha
-
-    print(f"  ✓ Dataset producción estandarizado: {df.shape}")
-    print(f"  ✓ Último mes con cosecha registrada: {ultimo_con_cosecha.date()}")
 
     return df
 
@@ -279,10 +332,6 @@ def construir_proyeccion(serie: pd.DataFrame, horizon: int = 12,
 
 
 def metricas_backtest(serie: pd.DataFrame, n_test: int = 6) -> dict:
-    """
-    Validación temporal: entrena con el pasado, prueba con los últimos
-    n_test meses cerrados. Devuelve MAE, RMSE y MAPE.
-    """
     vacio = {"MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "n_test": n_test}
 
     if serie is None or len(serie) <= n_test + 3:
@@ -396,12 +445,12 @@ def calcular_cuadrantes(df: pd.DataFrame, prod_col: str = "ton_ha",
     return agg
 
 
-def fig_scatter_cuadrantes(df_q, q_col, x_label, y_label, title) -> go.Figure:
+def fig_scatter_cuadrantes(df_q, q_col, label_col, x_label, y_label, title) -> go.Figure:
     if df_q.empty:
         return go.Figure()
     fig = go.Figure()
-    mapping = {"Q1": "brown", "Q2": "orange", "Q3": "green", "Q4": "dodgerblue"}
-    for q, color in mapping.items():
+    map_colores = {"Q1": "brown", "Q2": "orange", "Q3": "green", "Q4": "dodgerblue"}
+    for q, color in map_colores.items():
         sub = df_q[df_q[q_col] == q]
         if sub.empty:
             continue
@@ -409,7 +458,7 @@ def fig_scatter_cuadrantes(df_q, q_col, x_label, y_label, title) -> go.Figure:
             x=sub["media"], y=sub["de"], mode="markers",
             name=q, marker=dict(color=color, size=9, opacity=0.85,
                                 line=dict(color="white", width=0.8)),
-            text=sub["lote"].astype(str).tolist(),
+            text=sub[label_col].astype(str).tolist(),
             hovertemplate=(f"<b>%{{text}}</b><br>{x_label}: %{{x:.2f}}<br>"
                            f"{y_label}: %{{y:.2f}}<br>Cuadrante: {q}<extra></extra>"),
         ))
@@ -453,9 +502,9 @@ def seccion_kpis(data: pd.DataFrame):
     if not con_ppto.empty:
         ppto_total = con_ppto["ton_ppto"].sum()
         cumpl = ton_real / ppto_total * 100 if ppto_total > 0 else np.nan
-        anios_ppto = ", ".join(str(a) for a in sorted(con_ppto["ano"].unique().astype(int)))
+        campanias_ppto = ", ".join(sorted(con_ppto["campaña"].astype(str).unique()))
     else:
-        ppto_total, cumpl, anios_ppto = 0.0, np.nan, "—"
+        ppto_total, cumpl, campanias_ppto = 0.0, np.nan, "—"
 
     cols = st.columns(6)
     kpis = [
@@ -463,7 +512,7 @@ def seccion_kpis(data: pd.DataFrame):
         ("Lotes",          str(data["lote"].nunique()),                     "🌿"),
         ("Área neta",      f"{area:,.1f} ha",                               "📐"),
         ("Ton real",       f"{ton_real:,.1f} t",                            "🏋️"),
-        ("Ppto " + anios_ppto, f"{ppto_total:,.1f} t",                      "🎯"),
+        (f"Ppto {campanias_ppto}", f"{ppto_total:,.1f} t",                  "🎯"),
         ("Cumplimiento",   f"{cumpl:.1f} %" if pd.notna(cumpl) else "—",    "✅"),
     ]
     for col, (label, value, icon) in zip(cols, kpis):
@@ -569,7 +618,6 @@ def tab_proyeccion(df, mensual, corte, mes_curso, horizon, recent_periods):
     st.caption("Backtest sobre meses cerrados: el modelo se entrena sin la ventana de prueba. "
                "MAPE indica el error porcentual medio mensual de la línea base.")
 
-    # ── Tabla de proyección vs presupuesto ──
     st.markdown('<div class="section-title">Detalle de la proyección vs presupuesto</div>',
                 unsafe_allow_html=True)
     tabla = proj[["fecha", "ton_pred"]].copy()
@@ -586,6 +634,8 @@ def tab_proyeccion(df, mensual, corte, mes_curso, horizon, recent_periods):
         tabla[["Período", "Proyección (t)", "Ppto (t)", "Δ vs ppto (t)"]].round(1),
         use_container_width=True, hide_index=True,
     )
+
+    st.markdown("---")
 
 
 def tab_produccion(df, mensual):
@@ -626,7 +676,6 @@ def tab_produccion(df, mensual):
                                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_tree, use_container_width=True, key="prod_treemap")
 
-    # ── Real vs presupuesto mensual (meses con presupuesto) ──
     con_ppto = mensual[mensual["ton_ppto"].notna()].copy()
     if not con_ppto.empty:
         st.markdown('<div class="section-title">Producción real vs presupuesto — meses presupuestados</div>',
@@ -649,19 +698,17 @@ def tab_produccion(df, mensual):
                              legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_pp, use_container_width=True, key="prod_ppto")
 
-    # ── Resumen anual ──
-    st.markdown('<div class="section-title">Resumen anual</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Resumen por campaña (Abr–Mar)</div>', unsafe_allow_html=True)
     hist = df[df["es_historico"]]
-    anual = hist.groupby("ano", as_index=False).agg(
+    campania = hist.groupby("campaña", as_index=False).agg(
         ton_real=("ton_real", "sum"), ton_ppto=("ton_ppto", "sum"),
         racimos=("racimos", "sum"), area=("area_neta", "mean"),
     )
-    anual["ton_ha"] = np.where(anual["area"] > 0, anual["ton_real"] / anual["area"], np.nan)
-    anual = anual.rename(columns={"ano": "Año", "ton_real": "Ton real", "ton_ppto": "Ton ppto",
-                                  "racimos": "Racimos", "area": "Área ha", "ton_ha": "Ton/ha"})
-    st.dataframe(anual.round(2), use_container_width=True, hide_index=True)
+    campania["ton_ha"] = np.where(campania["area"] > 0, campania["ton_real"] / campania["area"], np.nan)
+    campania = campania.rename(columns={"campaña": "Campaña", "ton_real": "Ton real", "ton_ppto": "Ton ppto",
+                                        "racimos": "Racimos", "area": "Área ha", "ton_ha": "Ton/ha"})
+    st.dataframe(campania.round(2), use_container_width=True, hide_index=True)
 
-    # ── Ranking de lotes ──
     st.markdown('<div class="section-title">Ranking productivo por lote</div>', unsafe_allow_html=True)
     lote = (
         hist.groupby(["lote", "bloque", "material", "estado"], as_index=False)
@@ -689,6 +736,8 @@ def tab_produccion(df, mensual):
     st.caption("El ranking de mayor brecha negativa prioriza lotes para validación de campo. "
                "Cumplimiento solo se calcula sobre meses con presupuesto.")
 
+    st.markdown("---")
+
 
 def tab_cuadrantes(df):
     st.markdown('<div class="section-title">Análisis de Cuadrantes — Productividad vs Variabilidad</div>',
@@ -703,6 +752,7 @@ def tab_cuadrantes(df):
         "Lote": ("lote",),
         "Finca": ("finca",),
     }
+    label_col = group_map[group_q][0]
 
     df_q = calcular_cuadrantes(df, prod_col="ton_ha", group_cols=group_map[group_q])
     if df_q.empty:
@@ -710,10 +760,9 @@ def tab_cuadrantes(df):
         return
 
     q_col = "q_global" if modo_q == "Global" else "q_local"
-    label_col = group_map[group_q][0]
 
     st.plotly_chart(
-        fig_scatter_cuadrantes(df_q, q_col,
+        fig_scatter_cuadrantes(df_q, q_col, label_col,
                                "Productividad media (ton/ha)", "Variabilidad (DE)",
                                f"Cuadrantes — Nivel: {group_q} · Referencia: {modo_q}"),
         use_container_width=True, key=sanitize_key(f"q_scatter_{modo_q}_{group_q}"),
@@ -731,12 +780,11 @@ def tab_cuadrantes(df):
                               default=["Q1", "Q2", "Q3", "Q4"], key="q_filter")
 
     df_qd = df_q[df_q[q_col].isin(filtro_q)].copy()
-    extra = df.drop_duplicates("lote").set_index("lote")
+    extra = df.drop_duplicates(label_col).set_index(label_col)
 
-    df_qd["material"] = df_qd["lote"].map(extra["material"])
-    df_qd["estado"] = df_qd["lote"].map(extra["estado"])
-    df_qd["area_ha"] = df_qd["lote"].map(extra["area_neta"])
-    df_qd["edad"] = df_qd["lote"].map(extra["edad"])
+    for c_new, c_src in [("material", "material"), ("estado", "estado"),
+                         ("area_ha", "area_neta"), ("edad", "edad")]:
+        df_qd[c_new] = df_qd[label_col].map(extra[c_src]) if c_src in extra.columns else np.nan
 
     st.dataframe(
         df_qd[[label_col, "media", "de", q_col, "material", "estado", "area_ha", "edad"]]
@@ -747,6 +795,8 @@ def tab_cuadrantes(df):
                "Q2: baja y estable → deficiencia estructural. "
                "Q3: alta producción / alta variabilidad → potencial con variación. "
                "Q4: alta y estable → lotes de referencia.")
+
+    st.markdown("---")
 
 
 def tab_modelo(df):
@@ -766,6 +816,9 @@ def tab_modelo(df):
     if target == "ppr":
         df_model = df_model[df_model["racimos"] > 0]
 
+    df_model = df_model.sort_values("fecha")
+    df_model = df_model.dropna(subset=[target])
+
     feature_pool = [c for c in FEATURES_BASE if c in df_model.columns]
 
     dummies = pd.get_dummies(df_model["material"], prefix="mat")
@@ -778,25 +831,38 @@ def tab_modelo(df):
     keep = [c for c in X.columns if X[c].notna().any() and X[c].dropna().nunique() > 1]
     X = X[keep]
 
-    st.info(
-        "Variables excluidas por fuga de información o falta de cobertura: "
-        + ", ".join(exclusiones)
-        + ". Racimos y PPR componen directamente las toneladas cosechadas "
-        "(Ton Real = Racimos × PPR / 1000) y el presupuesto solo existe para 2026, "
-        "por lo que no se usan como predictors."
-    )
-
-    df_model = df_model.loc[X.index]
-    y = df_model[target].astype(float)
-
     n = len(df_model)
     if n < 30:
         st.warning(f"Registros insuficientes tras limpiar: {n}. Mínimo 30.")
         return
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, shuffle=True,
+    st.info(
+        "Variables excluidas por fuga de información o falta de cobertura: "
+        + ", ".join(exclusiones)
+        + ". Racimos y PPR componen directamente las toneladas cosechadas "
+        "(Ton Real = Racimos × PPR / 1000) y el presupuesto solo cubre los meses "
+        "presupuestados de la campaña vigente. **area_neta** se retiró del set de "
+        "variables: es estructural (tamaño del lote), satura la importancia del bosque "
+        "y no aporta señal agronómica."
     )
+
+    modo_split = st.radio(
+        "División train / test:",
+        ["Temporal (sin fuga)", "Aleatoria"],
+        index=0, horizontal=True, key="rf_split",
+        help="Temporal: entrena con los meses más antiguos y prueba con los más "
+             "recientes, igual que la proyección real. Aleatoria: mezcla meses; "
+             "puede inflar el R² por fuga temporal.",
+    )
+
+    if modo_split.startswith("Temporal"):
+        n_test = max(1, n // 5)
+        X_train, X_test = X.iloc[:-n_test], X.iloc[-n_test:]
+        y_train, y_test = y.iloc[:-n_test], y.iloc[-n_test:]
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=True,
+        )
 
     imputer = SimpleImputer(strategy="median")
     X_train_imp = pd.DataFrame(imputer.fit_transform(X_train), columns=X.columns, index=X_train.index)
@@ -812,7 +878,7 @@ def tab_modelo(df):
     r2 = r2_score(y_test, y_pred)
     err = y_test.to_numpy() - y_pred
     mae = float(np.mean(np.abs(err)))
-    rmse = float(np.sqrt(np.mean(err ** 2)))
+    rmse = float(np.sqrt(np.mean(np.square(err))))
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("R² (test)", f"{r2:.3f}")
@@ -828,21 +894,36 @@ def tab_modelo(df):
     if top5:
         cols_top = st.columns(len(top5))
         for i, feat in enumerate(top5):
-            vals = df_model[feat].dropna()
+            vals = X[feat].dropna()
             if len(vals) == 0:
                 continue
             p25, p75 = vals.quantile([0.25, 0.75])
-            mu_low = df_model.loc[df_model[feat] <= p25, target].mean()
-            mu_high = df_model.loc[df_model[feat] >= p75, target].mean()
+            es_dummy = set(vals.unique()) <= {0.0, 1.0}
+            if es_dummy:
+                mu_low = df_model.loc[X[feat] <= 0, target].mean()
+                mu_high = df_model.loc[X[feat] >= 1, target].mean()
+            else:
+                mu_low = df_model.loc[X[feat] <= p25, target].mean()
+                mu_high = df_model.loc[X[feat] >= p75, target].mean()
+            if pd.isna(mu_low) or pd.isna(mu_high):
+                continue
             delta = mu_high - mu_low
             color = COLORS["success"] if delta > 0 else COLORS["danger"]
+
+            if es_dummy:
+                mat = feat.replace("mat_", "")
+                lectura = (f"Sin {mat}: media <b>{mu_low:.2f}</b><br>"
+                           f"Con {mat}: media <b>{mu_high:.2f}</b>")
+            else:
+                lectura = (f"P25 menor o igual a {p25:.2f}: media <b>{mu_low:.2f}</b><br>"
+                           f"P75 mayor o igual a {p75:.2f}: media <b>{mu_high:.2f}</b>")
+
             cols_top[i].markdown(f"""
                 <div class="kpi-card" style="border-left:4px solid {color}; padding:8px; border-radius:6px;">
                   <div style="font-weight:700;">{feat}</div>
                   <div style="font-size:.85rem; margin-top:.35rem;">
-                    P25 ≤ {p25:.2f}: media <b>{mu_low:.2f}</b><br>
-                    P75 ≥ {p75:.2f}: media <b>{mu_high:.2f}</b><br>
-                    <span style="color:{color};font-weight:700;">Δ = {delta:+.2f}</span>
+                    {lectura}<br>
+                    <span style="color:{color};font-weight:700;">Delta = {delta:+.2f}</span>
                   </div>
                 </div>
             """, unsafe_allow_html=True)
@@ -852,9 +933,12 @@ def tab_modelo(df):
     c1, c2 = st.columns([1, 1.4])
     with c1:
         imp_plot = imp_desc.head(20).sort_values("importancia", ascending=True)
-        fig_imp = px.bar(imp_plot, x="importancia", y="variable", orientation="h",
-                         color="importancia", color_continuous_scale="Greens")
+        fig_imp = px.bar(
+            imp_plot, x="importancia", y="variable", orientation="h",
+            color_discrete_sequence=[COLORS["primary"]],
+        )
         fig_imp.update_layout(height=480, margin=dict(t=10, l=0, r=0, b=0),
+                              xaxis_title="Importancia", yaxis_title="",
                               template="plotly_white", paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_imp, use_container_width=True, key="rf_importance")
 
@@ -877,11 +961,14 @@ def tab_modelo(df):
 
     st.caption(
         "Modelo estructural de producción: predice el desempeño mensual del lote "
-        "a partir de edad, área, días de ciclo, estacionalidad y material genético. "
-        "Es un modelo de referencia operativa; el diagnóstico causal agronómico "
+        "a partir de edad, días de ciclo, estacionalidad y material genético. "
+        "La división temporal respeta el orden de las campañas Abr–Mar: entrena con "
+        "el pasado y prueba con los meses recientes. El diagnóstico causal agronómico "
         "(suelo, clima, nutrición, sanidad) requiere integrar esas fuentes en una "
         "siguiente versión del pipeline."
     )
+
+    st.markdown("---")
 
 
 # ════════════════════════════════════════════════════
@@ -907,6 +994,7 @@ def render_sidebar():
 
         st.markdown("---")
         st.markdown("### ℹ️ Columnas requeridas")
+
         st.markdown("""
         | **Variable** | **Nombre interno** | **Variantes aceptadas** |
         |:-------------|:-------------------|:-------------------------|
@@ -941,7 +1029,6 @@ def render_sidebar():
 # 8. MAIN
 # ════════════════════════════════════════════════════
 
-
 def main():
     uploaded = render_sidebar()
 
@@ -955,54 +1042,45 @@ def main():
     if uploaded is None:
         st.markdown("""
         <div class="upload-zone">
-            <h3>📂 Sube tu archivo Excel o CSV para comenzar</h3>
+            <h3>Sube tu archivo Excel o CSV para comenzar</h3>
             <p>Usa el panel lateral para cargar el archivo.</p>
             <p><strong>Formatos soportados:</strong> .xlsx · .xls · .csv</p>
-            <p><strong>Columnas principales:</strong> Finca · Lote · Año · Mes ·
-            Ton Real · Ton Ppto · Racimos · PPR · Área neta · Días de ciclo · Material · Estado</p>
+            <p><strong>Columnas:</strong> consulta la tabla de esquema en el panel lateral.</p>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("### 📌 ¿Qué puedes analizar?")
-
+        st.markdown("### ¿Qué puedes analizar?")
         c1, c2, c3, c4 = st.columns(4)
         c1.info(
             "**Proyección de producción**\n\n"
-            "Proyecta la producción futura a partir de la tendencia histórica "
-            "y la estacionalidad mensual."
+            "Proyección basada en la tendencia histórica y la estacionalidad mensual."
         )
         c2.info(
             "**Productividad y presupuesto**\n\n"
-            "Analiza la producción en ton/ha, compara resultados reales frente "
-            "al presupuesto y consulta el cumplimiento."
+            "Producción en ton/ha, comparación con presupuesto y cumplimiento."
         )
         c3.info(
             "**Análisis de lotes**\n\n"
-            "Identifica diferencias de productividad y variabilidad mediante "
-            "cuadrantes y análisis por lote, finca, material y zona."
+            "Variabilidad y productividad por lote, finca, material y zona."
         )
         c4.info(
             "**Modelo predictivo**\n\n"
-            "Estima Ton Real o PPR mediante un modelo Random Forest utilizando "
-            "edad, área, días de ciclo, estacionalidad y material genético."
+            "Estimación de Ton Real o PPR con Random Forest."
         )
-
         return
-
-    else:
-        with st.spinner("⏳ Procesando datos..."):
-            file_bytes = uploaded.read()
-            file_name = uploaded.name
 
     try:
-        data = cargar_dataset_produccion(file_bytes, file_name=file_name)
-        mensual, corte, mes_curso = construir_serie_mensual(data)
+        with st.spinner("Procesando datos..."):
+            file_bytes = uploaded.read()
+            data = cargar_dataset_produccion(
+                file_bytes,
+                file_name=uploaded.name,
+            )
     except ValueError as e:
-        st.error(f"❌ Error al cargar el archivo:\n\n{e}")
+        st.error(f"Error al cargar el archivo:\n\n{e}")
         return
     except Exception as e:
-        st.error(f"❌ Error inesperado: {e}")
+        st.error(f"Error inesperado al procesar el archivo: {e}")
         return
 
     if data.empty:
@@ -1010,40 +1088,70 @@ def main():
         return
 
     with st.sidebar:
-        st.markdown("---")
         st.markdown("### 🔎 Filtros")
 
         def multiselect_col(df, col, key):
             opciones = sorted(df[col].dropna().unique().tolist())
-            return st.multiselect(f"{col.replace('_', ' ').capitalize()}:", opciones,
-                                  default=opciones, key=key)
+            return st.multiselect(
+                f"{col.replace('_', ' ').capitalize()}:",
+                options=opciones,
+                default=opciones,
+                key=key,
+            )
 
         gz_sel = multiselect_col(data, "gran_zona", "f_gz")
         bloque_sel = multiselect_col(data, "bloque", "f_bloque")
         mat_sel = multiselect_col(data, "material", "f_mat")
         est_sel = multiselect_col(data, "estado", "f_est")
-        anios_all = sorted(pd.to_numeric(data["ano"], errors="coerce").dropna().unique().astype(int).tolist())
-        anio_sel = st.multiselect("Año:", anios_all, default=anios_all, key="f_ano")
-        lote_q = st.text_input("Buscar Lote:", "", key="f_lote")
+
+        campanias_all = sorted(data["campaña"].dropna().astype(str).unique().tolist())
+        cam_sel = st.multiselect(
+            "Campaña agronómica (abril–marzo):",
+            options=campanias_all,
+            default=campanias_all,
+            key="f_campania",
+        )
+
+        lote_q = st.text_input("Buscar lote:", "", key="f_lote")
 
         st.markdown("---")
-        st.markdown("### ⚙️ Parámetros del modelo")
-        horizon = st.slider("Meses a proyectar:", 3, 48, 12, step=3, key="p_horizon")
-        recent = st.slider("Meses de historial por el modelo:", 3, 24, 12, key="p_recent")
+        st.markdown("### Parámetros del modelo")
+        horizon = st.slider(
+            "Meses a proyectar:",
+            min_value=3,
+            max_value=48,
+            value=12,
+            step=3,
+            key="p_horizon",
+        )
+        recent = st.slider(
+            "Meses de historial por el modelo:",
+            min_value=3,
+            max_value=24,
+            value=12,
+            key="p_recent",
+        )
 
     df = data.copy()
     df = df[df["gran_zona"].isin(gz_sel)]
     df = df[df["bloque"].isin(bloque_sel)]
     df = df[df["material"].isin(mat_sel)]
     df = df[df["estado"].isin(est_sel)]
-    df = df[df["ano"].astype(int).isin(anio_sel)]
+    df = df[df["campaña"].astype(str).isin(cam_sel)]
+
     if lote_q.strip():
-        df = df[df["lote"].astype(str).str.contains(lote_q.strip(), case=False, na=False)]
+        df = df[
+            df["lote"].astype(str).str.contains(
+                lote_q.strip(),
+                case=False,
+                na=False,
+            )
+        ]
 
     st.sidebar.write(f"Registros filtrados: **{len(df):,}**")
 
     if df.empty:
-        st.warning("Sin datos con los filtros actuales.")
+        st.warning("No hay datos con los filtros actuales.")
         return
 
     mensual_f, corte_f, curso_f = construir_serie_mensual(df)
@@ -1051,7 +1159,12 @@ def main():
     seccion_kpis(df)
     st.markdown("---")
 
-    tab_names = ["📌 Proyección", "📊 Producción", "🔲 Cuadrantes", "📋 Modelo RF"]
+    tab_names = [
+        "🔬 Proyección",
+        "📊 Producción",
+        "🔲 Cuadrantes",
+        "🌲 Modelo RF",
+    ]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
